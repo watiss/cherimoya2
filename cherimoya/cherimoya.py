@@ -29,6 +29,14 @@ from tangermeme.predict import predict
 from bpnetlite.logging import Logger
 
 
+class _Log(torch.nn.Module):
+    def __init__(self):
+        super(_Log, self).__init__()
+
+    def forward(self, X):
+        return torch.log(X)
+	
+
 def autotune_configs():
     num_warps = [4, 8, 16]
     num_stages = [2, 3, 4, 5]
@@ -300,8 +308,10 @@ class CheriBlock2(torch.nn.Module):
 
 		self.conv = torch.nn.Conv1d(n_filters, n_filters, groups=n_filters, dilation=dilation, padding=dilation, kernel_size=3)
 		self.norm = torch.nn.LayerNorm((n_filters, 2114), elementwise_affine=False, bias=False, eps=1e-3)		
-		self.linear1 = torch.nn.Conv1d(n_filters, 3*n_filters, kernel_size=1, bias=False)
-		self.linear2 = torch.nn.Conv1d(3*n_filters, n_filters, kernel_size=1, bias=False)
+		# self.linear1 = torch.nn.Conv1d(n_filters, 3*n_filters, kernel_size=1, bias=False)
+		# self.linear2 = torch.nn.Conv1d(3*n_filters, n_filters, kernel_size=1, bias=False)
+		self.linear1 = torch.nn.Conv1d(n_filters, 2*n_filters, kernel_size=1, bias=False)
+		self.linear2 = torch.nn.Conv1d(2*n_filters, n_filters, kernel_size=1, bias=False)
 		self.gamma = torch.nn.Parameter(torch.ones(n_filters, 1) * eps) 
 		self.activation = torch.nn.GELU(approximate='tanh')
 		
@@ -335,7 +345,8 @@ class Cherimoya(torch.nn.Module):
 		self.igelu = torch.nn.GELU(approximate='tanh')
 
 		self.blocks = torch.nn.ModuleList([
-			CheriBlock(n_filters, 2**i) for i in range(self.n_layers)
+			# CheriBlock(n_filters, 2**i) for i in range(self.n_layers)
+			CheriBlock2(n_filters, 2**i) for i in range(self.n_layers)
 		])
 		
 		self.fconv = torch.nn.Conv1d(n_filters+n_control_tracks, n_outputs, 
@@ -362,8 +373,9 @@ class Cherimoya(torch.nn.Module):
 			"Validation Count Pearson", "Validation Count MSE", "Saved?"], 
 			verbose=verbose)
 
+		self._log = _Log()
 
-	@torch.compile(mode='max-autotune')
+	# @torch.compile(mode='max-autotune')
 	def forward(self, X, X_ctl=None):
 		"""A forward pass of the model.
 
@@ -393,11 +405,15 @@ class Cherimoya(torch.nn.Module):
 		start, end = self.trimming, X.shape[2] - self.trimming
 		
 		X = self.igelu(self.iconv(X))
-		X = X.transpose(1, 2).contiguous()
+		# CheriBlock needs (N, L, C); CheriBlock2 uses Conv1d and needs (N, C, L)
+		using_cheriblock2 = isinstance(self.blocks[0], CheriBlock2)
+		if not using_cheriblock2:
+			X = X.transpose(1, 2).contiguous()
 		for i in range(self.n_layers):
 			X = self.blocks[i](X)
 
-		X = X.transpose(1, 2).contiguous()
+		if not using_cheriblock2:
+			X = X.transpose(1, 2).contiguous()
 		if X_ctl is None:
 			X_w_ctl = X
 		else:
@@ -410,7 +426,8 @@ class Cherimoya(torch.nn.Module):
 		if X_ctl is not None:
 			X_ctl = torch.sum(X_ctl[:, :, start-37:end+37].float(), dim=(1, 2))
 			X_ctl = X_ctl.unsqueeze(-1)
-			X = torch.cat([X, torch.log(X_ctl+1)], dim=-1)
+			# X = torch.cat([X, torch.log(X_ctl+1)], dim=-1)
+			X = torch.cat([X, self._log(X_ctl+1)], dim=-1)
 
 		y_counts = self.linear(X)
 		return y_profile, y_counts
@@ -519,7 +536,8 @@ class Cherimoya(torch.nn.Module):
 				y = y.to(device)
 				
 				# Clear the optimizer and set the model to training mode
-				muon_optimizer.zero_grad()
+				if muon_optimizer is not None:
+					muon_optimizer.zero_grad()
 				adam_optimizer.zero_grad()
 				self.train()
 
@@ -540,10 +558,12 @@ class Cherimoya(torch.nn.Module):
 				
 				loss.backward()
 				
-				muon_optimizer.step()
+				if muon_optimizer is not None:
+					muon_optimizer.step()
 				adam_optimizer.step()
 
-				muon_scheduler.step()
+				if muon_scheduler is not None:
+					muon_scheduler.step()
 				adam_scheduler.step()
 
 				iteration += 1

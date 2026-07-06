@@ -6,6 +6,11 @@ training_chroms = ["chr2", "chr4", "chr5", "chr7", "chr9", "chr10", "chr11",
     "chr21", "chr22", "chrX", "chrY"]
 
 validation_chroms = ['chr8', 'chr20']
+test_chroms = ['chr1', 'chr3', 'chr6']
+
+assert not (set(training_chroms) & set(validation_chroms))
+assert not (set(training_chroms) & set(test_chroms))
+assert not (set(validation_chroms) & set(test_chroms))
 
 
 default_fit_parameters = {
@@ -29,6 +34,7 @@ default_fit_parameters = {
 	'verbose': False,
 	'training_chroms': training_chroms,
 	'validation_chroms': validation_chroms,
+	'test_chroms': test_chroms,
 	'sequences': None,
 	'loci': None,
 	'exclusion_lists': None,
@@ -188,6 +194,7 @@ default_pipeline_parameters = {
 		'max_epochs': 100,
 		'training_chroms': training_chroms,
 		'validation_chroms': validation_chroms,
+		'test_chroms': test_chroms,
 		'sequences': None,
 		'loci': None,
 		'negatives': None,

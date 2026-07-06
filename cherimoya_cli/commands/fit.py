@@ -138,23 +138,30 @@ def run(args):
 		else:
 			adam_params.append(p)
 
-	muon_optimizer = Muon(muon_params, lr=0.01, weight_decay=0.0)
-	muon_warmup_scheduler = LinearLR(muon_optimizer, start_factor=0.01, total_iters=num_iters)
-	muon_decay_scheduler = CosineAnnealingLR(muon_optimizer, T_max=len(training_data)*50, eta_min=1e-5)
-	muon_scheduler = SequentialLR(
-		muon_optimizer,
-		schedulers=[muon_warmup_scheduler, muon_decay_scheduler],
-		milestones=[num_iters]
-	)
-
-	adam_optimizer = torch.optim.AdamW(adam_params, lr=0.004, weight_decay=0.0)
-	adam_warmup_scheduler = LinearLR(adam_optimizer, start_factor=0.01, total_iters=num_iters)
-	adam_decay_scheduler = CosineAnnealingLR(adam_optimizer, T_max=len(training_data)*50, eta_min=1e-5)
-	adam_scheduler = SequentialLR(
-		adam_optimizer,
-		schedulers=[adam_warmup_scheduler, adam_decay_scheduler],
-		milestones=[num_iters]
-	)
+	if muon_params != []:
+		print("Using Muon optimizer for {} parameters.".format(len(muon_params)))
+		muon_optimizer = Muon(muon_params, lr=0.01, weight_decay=0.0)
+		muon_warmup_scheduler = LinearLR(muon_optimizer, start_factor=0.01, total_iters=num_iters)
+		muon_decay_scheduler = CosineAnnealingLR(muon_optimizer, T_max=len(training_data)*50, eta_min=1e-5)
+		muon_scheduler = SequentialLR(
+			muon_optimizer,
+			schedulers=[muon_warmup_scheduler, muon_decay_scheduler],
+			milestones=[num_iters]
+		)
+	else:
+		print("No parameters for Muon optimizer, using AdamW for all parameters.")
+		muon_optimizer = None
+		muon_scheduler = None
+		
+		adam_optimizer = torch.optim.AdamW(adam_params, lr=0.004, weight_decay=0.0)
+		adam_warmup_scheduler = LinearLR(adam_optimizer, start_factor=0.01, total_iters=num_iters)
+		adam_decay_scheduler = CosineAnnealingLR(adam_optimizer, T_max=len(training_data)*50, eta_min=1e-5)
+		adam_scheduler = SequentialLR(
+			adam_optimizer,
+			schedulers=[adam_warmup_scheduler, adam_decay_scheduler],
+			milestones=[num_iters]
+		)
+		print("Using Adam optimizer for {} parameters.".format(len(adam_params)))
 
 	model.fit(training_data,
 		muon_optimizer, adam_optimizer,
@@ -171,7 +178,9 @@ def run(args):
 	### Evaluate Model
 
 	evaluate_parameters = copy.deepcopy(parameters)
-	evaluate_parameters['chroms'] = parameters['validation_chroms']
+	# evaluate_parameters['chroms'] = parameters['validation_chroms']
+	# TODO should probably add this to the default params?
+	evaluate_parameters['chroms'] = parameters['test_chroms']
 	evaluate_parameters['max_jitter'] = 0
 	evaluate_parameters['reverse_complement'] = False
 	evaluate_parameters['model'] = parameters['name'] + '.torch'
