@@ -115,7 +115,8 @@ def run(args):
 		single_count_output=parameters['single_count_output'],
 		trimming=trimming,
 		name=parameters['name'],
-		verbose=parameters['verbose']
+		verbose=parameters['verbose'],
+		cheriblock2=parameters['cheriblock2'],
 	).to(parameters['device'])
 
 	if parameters['verbose']:
@@ -153,15 +154,15 @@ def run(args):
 		muon_optimizer = None
 		muon_scheduler = None
 		
-		adam_optimizer = torch.optim.AdamW(adam_params, lr=0.004, weight_decay=0.0)
-		adam_warmup_scheduler = LinearLR(adam_optimizer, start_factor=0.01, total_iters=num_iters)
-		adam_decay_scheduler = CosineAnnealingLR(adam_optimizer, T_max=len(training_data)*50, eta_min=1e-5)
-		adam_scheduler = SequentialLR(
-			adam_optimizer,
-			schedulers=[adam_warmup_scheduler, adam_decay_scheduler],
-			milestones=[num_iters]
-		)
-		print("Using Adam optimizer for {} parameters.".format(len(adam_params)))
+	print("Using Adam optimizer for {} parameters.".format(len(adam_params)))
+	adam_optimizer = torch.optim.AdamW(adam_params, lr=0.004, weight_decay=0.0)
+	adam_warmup_scheduler = LinearLR(adam_optimizer, start_factor=0.01, total_iters=num_iters)
+	adam_decay_scheduler = CosineAnnealingLR(adam_optimizer, T_max=len(training_data)*50, eta_min=1e-5)
+	adam_scheduler = SequentialLR(
+		adam_optimizer,
+		schedulers=[adam_warmup_scheduler, adam_decay_scheduler],
+		milestones=[num_iters]
+	)
 
 	model.fit(training_data,
 		muon_optimizer, adam_optimizer,

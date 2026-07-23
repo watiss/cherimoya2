@@ -52,6 +52,14 @@ def main():
 		'pipeline': pipeline.run,
 	}
 
+	# save configs to disk in output dir
+	args_d = vars(args)
+	if "args_dir" in args_d:
+		import os
+		import json
+		with open(os.path.join(args.args_dir, 'args.json'), 'w') as f:
+			json.dump(args_d, f, indent=4)
+
 	commands[args.cmd](args)
 
 

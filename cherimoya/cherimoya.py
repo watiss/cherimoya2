@@ -214,6 +214,20 @@ def bwd_conv_kernel(
 		dw1 += tl.sum(d_conv * x1, axis=0)[None, :]
 		dw2 += tl.sum(d_conv * x2, axis=0)[None, :]
 	
+		# dx_idx0 = dX_ptr + pid_n * stride_xn + offs * C + offs_c
+
+		# dx1 = tl.load(dx_idx0, mask=mask, other=0.0)
+		# dx0 = tl.load(dx_idx0 - dilation*C, mask=mask_l, other=0.0)
+		# dx2 = tl.load(dx_idx0 + dilation*C, mask=mask_r, other=0.0)
+	
+		# dx1 += d_conv * w1
+		# dx0 += d_conv * w0
+		# dx2 += d_conv * w2
+	
+		# tl.store(dx_idx0,              dx1, mask=mask)
+		# tl.store(dx_idx0 - dilation*C, dx0, mask=mask_l)
+		# tl.store(dx_idx0 + dilation*C, dx2, mask=mask_r)
+	
 		dx_idx = dX_ptr + pid_n * stride_xn + offs * C + offs_c
 		tl.atomic_add(dx_idx, d_conv * w1, mask=mask)
 		tl.atomic_add(dx_idx - dilation * C, d_conv * w0, mask=mask_l)
@@ -268,28 +282,74 @@ class FusedDilatedConvNormFunc(torch.autograd.Function):
 
 ###
 
-		
+
+class FusedDilatedConvNorm(torch.nn.Module):
+	"""nn.Module wrapper around FusedDilatedConvNormFunc.
+
+	This wrapper adds only Python-level module dispatch -- the Triton
+	kernel and its single launch are unchanged, and the op stays fused.
+	"""
+
+	def __init__(self, n_filters, dilation):
+		super().__init__()
+		self.n_filters = n_filters
+		self.dilation = dilation
+
+		self.conv_weight = torch.nn.Parameter(torch.randn(3, n_filters))
+		torch.nn.init.trunc_normal_(self.conv_weight, std=0.02)
+
+	def forward(self, X):
+		assert X.ndim == 3, f"expected (N, L, C), got {tuple(X.shape)}"
+		assert X.shape[-1] == self.n_filters, (
+			f"channel dim {X.shape[-1]} != n_filters {self.n_filters}")
+		return FusedDilatedConvNormFunc.apply(X, self.conv_weight, self.dilation)
+
 class CheriBlock(torch.nn.Module):
 	def __init__(self, n_filters, dilation, eps=0.01):
 		super().__init__()
 		self.n_filters = n_filters
 		self.dilation = dilation
 
-		self.conv_weight = torch.nn.Parameter(torch.randn(3, n_filters))	
+		self.conv = FusedDilatedConvNorm(n_filters, dilation)	
 		self.linear1 = torch.nn.Linear(n_filters, 2*n_filters, bias=False)
 		self.linear2 = torch.nn.Linear(2*n_filters, n_filters, bias=False)
 		self.gamma = torch.nn.Parameter(torch.ones(1, n_filters) * eps)
 		self.activation = torch.nn.GELU(approximate='tanh')
 
-		torch.nn.init.trunc_normal_(self.conv_weight, std=0.02)
 		torch.nn.init.trunc_normal_(self.linear1.weight, std=0.02)
 		torch.nn.init.trunc_normal_(self.linear2.weight, std=0.02)
-	
+
+	def __setstate__(self, state):
+		# restore the normal nn.Module state first
+		super().__setstate__(state)
+
+		# new-format checkpoint: nothing to migrate
+		if "conv" in self._modules:
+			return
+
+		# old-format checkpoint: weight lived directly on CheriBlock
+		conv_weight = self._parameters.pop("conv_weight", None)
+		if conv_weight is None:
+			raise RuntimeError(
+				"Legacy CheriBlock has neither 'conv' nor 'conv_weight'"
+			)
+
+		print("Restoring legacy CheriBlock with conv_weight of shape", conv_weight.shape)
+		conv = FusedDilatedConvNorm(
+			self.n_filters,
+			self.dilation,
+		)
+
+		# replace the temporary random parameter with the trained parameter
+		conv.conv_weight = conv_weight
+
+		self.conv = conv
+
 	def forward(self, X):
-		X_conv = FusedDilatedConvNormFunc.apply(X, self.conv_weight, self.dilation)
+		X_conv = self.conv(X)
 		X_mlp = self.linear2(self.activation(self.linear1(X_conv)))
 		return X + X_mlp * self.gamma
-		
+
 
 class CheriBlock2(torch.nn.Module):
 	def __init__(self, n_filters, dilation, eps=0.01):
@@ -299,8 +359,6 @@ class CheriBlock2(torch.nn.Module):
 
 		self.conv = torch.nn.Conv1d(n_filters, n_filters, groups=n_filters, dilation=dilation, padding=dilation, kernel_size=3)
 		self.norm = torch.nn.LayerNorm((n_filters, 2114), elementwise_affine=False, bias=False, eps=1e-3)		
-		# self.linear1 = torch.nn.Conv1d(n_filters, 3*n_filters, kernel_size=1, bias=False)
-		# self.linear2 = torch.nn.Conv1d(3*n_filters, n_filters, kernel_size=1, bias=False)
 		self.linear1 = torch.nn.Conv1d(n_filters, 2*n_filters, kernel_size=1, bias=False)
 		self.linear2 = torch.nn.Conv1d(2*n_filters, n_filters, kernel_size=1, bias=False)
 		self.gamma = torch.nn.Parameter(torch.ones(n_filters, 1) * eps) 
@@ -318,11 +376,10 @@ class CheriBlock2(torch.nn.Module):
 		return X
 
 
-
 class Cherimoya(torch.nn.Module):
 	def __init__(self, n_filters=64, n_layers=9, n_outputs=1, 
 		n_control_tracks=0, name=None, trimming=None, 
-		single_count_output=True, verbose=True):
+		single_count_output=True, verbose=True, cheriblock2: bool = False):
 		super(Cherimoya, self).__init__()
 		self.n_filters = n_filters
 		self.n_layers = n_layers
@@ -335,9 +392,9 @@ class Cherimoya(torch.nn.Module):
 		self.iconv = torch.nn.Conv1d(4, n_filters, kernel_size=19, padding=9)
 		self.igelu = torch.nn.GELU(approximate='tanh')
 
+		cheri_cls = CheriBlock2 if cheriblock2 else CheriBlock
 		self.blocks = torch.nn.ModuleList([
-			# CheriBlock(n_filters, 2**i) for i in range(self.n_layers)
-			CheriBlock2(n_filters, 2**i) for i in range(self.n_layers)
+			cheri_cls(n_filters, 2**i) for i in range(self.n_layers)
 		])
 		
 		self.fconv = torch.nn.Conv1d(n_filters+n_control_tracks, n_outputs, 
@@ -366,7 +423,7 @@ class Cherimoya(torch.nn.Module):
 
 		self._log = _Log()
 
-	# @torch.compile(mode='max-autotune')
+	@torch.compile(mode='max-autotune')
 	def forward(self, X, X_ctl=None):
 		"""A forward pass of the model.
 
@@ -417,7 +474,6 @@ class Cherimoya(torch.nn.Module):
 		if X_ctl is not None:
 			X_ctl = torch.sum(X_ctl[:, :, start-37:end+37].float(), dim=(1, 2))
 			X_ctl = X_ctl.unsqueeze(-1)
-			# X = torch.cat([X, torch.log(X_ctl+1)], dim=-1)
 			X = torch.cat([X, self._log(X_ctl+1)], dim=-1)
 
 		y_counts = self.linear(X)
