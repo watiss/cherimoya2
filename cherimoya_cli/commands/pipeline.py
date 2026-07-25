@@ -93,8 +93,7 @@ def run(args):
 
 		cmd_args = [
 			"bam2bw",
-			# "-s", parameters['sequences'],
-			"-s", "/large_storage/goodarzilab/valehvpa/refs/hg38/hg38.chrom.sizes",
+			"-s", parameters['sequences'],
 			"-n", pname,
 			"-ps", str(preprocess_parameters['pos_shift']),
 			"-ns", str(preprocess_parameters['neg_shift']),
@@ -124,8 +123,7 @@ def run(args):
 		if parameters['controls'][0].endswith(ftypes):
 			cmd_args = [
 				"bam2bw",
-				# "-s", parameters['sequences'],
-				"-s", "/large_storage/goodarzilab/valehvpa/refs/hg38/hg38.chrom.sizes",
+				"-s", parameters['sequences'],
 				"-n", pname + ".control",
 				"-ps", str(preprocess_parameters['pos_shift']),
 				"-ns", str(preprocess_parameters['neg_shift']),
