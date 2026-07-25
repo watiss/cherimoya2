@@ -134,7 +134,7 @@ def fwd_conv_kernel(
 @triton.jit
 def bwd_conv_kernel(
 	dY_ptr, X_ptr, W_ptr, Mean_ptr, Rstd_ptr,
-    dX_ptr, dW_ptr, stride_xn, dilation,
+    dX_ptr, dW_ptr, Cnt_ptr, stride_xn, dilation,  # DEBUG: Cnt_ptr = collision counter
 	L: tl.constexpr, 
 	C: tl.constexpr, 
 	BLOCK_C: tl.constexpr, 
@@ -214,24 +214,52 @@ def bwd_conv_kernel(
 		dw1 += tl.sum(d_conv * x1, axis=0)[None, :]
 		dw2 += tl.sum(d_conv * x2, axis=0)[None, :]
 	
-		# dx_idx0 = dX_ptr + pid_n * stride_xn + offs * C + offs_c
+		dx_idx0 = dX_ptr + pid_n * stride_xn + offs * C + offs_c
 
-		# dx1 = tl.load(dx_idx0, mask=mask, other=0.0)
-		# dx0 = tl.load(dx_idx0 - dilation*C, mask=mask_l, other=0.0)
-		# dx2 = tl.load(dx_idx0 + dilation*C, mask=mask_r, other=0.0)
+		dx1 = tl.load(dx_idx0, mask=mask, other=0.0)
+		dx0 = tl.load(dx_idx0 - dilation*C, mask=mask_l, other=0.0)
+		dx2 = tl.load(dx_idx0 + dilation*C, mask=mask_r, other=0.0)
 	
-		# dx1 += d_conv * w1
-		# dx0 += d_conv * w0
-		# dx2 += d_conv * w2
+		dx1 += d_conv * w1
+		dx0 += d_conv * w0
+		dx2 += d_conv * w2
+
+		# --- DEBUG: collision counter (remove after debugging) ---
+		# Count, per dX position, how many lanes target it this iteration.
+		# Mirrors the exact addresses of the three non-atomic stores below.
+		# Any final count > 1 means multiple lanes wrote the same position
+		# non-atomically (the real stores clobber instead of accumulate).
+		cnt_idx = Cnt_ptr + pid_n * stride_xn + offs * C + offs_c
+		tl.atomic_add(cnt_idx,              1, mask=mask)
+		tl.atomic_add(cnt_idx - dilation*C, 1, mask=mask_l)
+		tl.atomic_add(cnt_idx + dilation*C, 1, mask=mask_r)
+		# --- END DEBUG ---
+
+		# KNOWN BUG (race): the three stores below scatter each output
+		# position's gradient into THREE dX positions (self, -dilation, +dilation).
+		# So a single dX position accumulates contributions from three different
+		# sources, and the plain load->add->store here is NOT atomic. Two kinds of
+		# overlap make two sources land on the same dX position concurrently:
+		#   1. Intra-block: two lanes in this block are `dilation` apart, so one
+		#      lane's +/-dilation store hits another lane's self store. Happens
+		#      whenever dilation < BLOCK_L.
+		#   2. Cross-block: this block's +dilation stores reach into the next
+		#      block's positions (and -dilation into the previous block's), so
+		#      adjacent loop iterations write the same positions. Happens for
+		#      essentially any dilation > 0.
+		# When two such writes overlap in time they each read the same old value
+		# and one overwrites the other -> a gradient contribution is silently
+		# lost. The DEBUG counter above confirms this: every dX position ends up
+		# written more than once. The commented atomic_add block below is the
+		# correct fix (indivisible read-add-write); these plain stores are the bug.
+		tl.store(dx_idx0,              dx1, mask=mask)
+		tl.store(dx_idx0 - dilation*C, dx0, mask=mask_l)
+		tl.store(dx_idx0 + dilation*C, dx2, mask=mask_r)
 	
-		# tl.store(dx_idx0,              dx1, mask=mask)
-		# tl.store(dx_idx0 - dilation*C, dx0, mask=mask_l)
-		# tl.store(dx_idx0 + dilation*C, dx2, mask=mask_r)
-	
-		dx_idx = dX_ptr + pid_n * stride_xn + offs * C + offs_c
-		tl.atomic_add(dx_idx, d_conv * w1, mask=mask)
-		tl.atomic_add(dx_idx - dilation * C, d_conv * w0, mask=mask_l)
-		tl.atomic_add(dx_idx + dilation * C, d_conv * w2, mask=mask_r)
+		# dx_idx = dX_ptr + pid_n * stride_xn + offs * C + offs_c
+		# tl.atomic_add(dx_idx, d_conv * w1, mask=mask)
+		# tl.atomic_add(dx_idx - dilation * C, d_conv * w0, mask=mask_l)
+		# tl.atomic_add(dx_idx + dilation * C, d_conv * w2, mask=mask_r)
 
 	dw_idx = dW_ptr + pid_n * (C * 3) + offs_c
 	tl.store(dw_idx,       dw0, mask=mask_c)
@@ -240,6 +268,10 @@ def bwd_conv_kernel(
 	
 
 class FusedDilatedConvNormFunc(torch.autograd.Function):
+	# NOTE: backward's dX scatter has a known write race -- multiple sources
+	# accumulate into the same dX position via non-atomic load-add-store, so
+	# gradient contributions get lost. See the "KNOWN BUG (race)" comment in
+	# bwd_conv_kernel; the atomic_add variant there is the correct fix.
 	@staticmethod
 	def forward(ctx, x, w, dilation):
 		N, L, C = x.shape
@@ -269,14 +301,28 @@ class FusedDilatedConvNormFunc(torch.autograd.Function):
 		dy = dy.contiguous()
 		dx = torch.zeros_like(x, dtype=x.dtype)
 		dw = torch.empty((N, 3, C), device=x.device, dtype=torch.float32)
-		
+
+		# DEBUG: per-position write counter, same layout/stride as dx.
+		# Zeroed; kernel atomic_adds 1 per targeted store. Any count > 1
+		# marks a dX position written by multiple non-atomic stores (a race).
+		cnt = torch.zeros_like(x, dtype=torch.int32)
+
 		bwd_conv_kernel[(N,)](
-			dy, x, w, mean, rstd, dx, dw, 
+			dy, x, w, mean, rstd, dx, dw, cnt,
 			x.stride(0), ctx.dilation,
-			L, C, BLOCK_C, 
+			L, C, BLOCK_C,
 		)
-	
-		dw = dw.sum(dim=0)		
+
+		# DEBUG: autotune may launch the kernel several times, so counts can be
+		# an integer multiple of the true per-launch value -- that only inflates
+		# counts, never hides a collision, so `> 1` remains a valid race signal.
+		n_collided = int((cnt > 1).sum().item())
+		assert n_collided == 0, (
+			f"dX write race: {n_collided} positions written by >1 lane "
+			f"(dilation={ctx.dilation}, L={L}, C={C}); max count={int(cnt.max().item())}"
+		)
+
+		dw = dw.sum(dim=0)
 		return dx.to(x.dtype), dw.to(x.dtype), None
 
 
@@ -665,3 +711,39 @@ class Cherimoya(torch.nn.Module):
 				break
 
 		torch.save(self, "{}.final.torch".format(self.name))
+
+
+###
+# DEBUG: standalone dX-write-race detector (remove after debugging).
+#
+# This file uses relative imports, so it can't be run as `python cherimoya.py`.
+# Run it as a module from the project root (the dir *containing* `cherimoya/`):
+#
+#     python -m cherimoya.cherimoya
+#
+# It builds a small random input, runs forward + backward, and lets the
+# `assert` inside FusedDilatedConvNormFunc.backward do the work: if any dX
+# position is written by more than one lane, the assert fires and prints how
+# many positions collided. If it runs clean, no race showed up for that config.
+###
+
+def _detect_dx_write_race():
+	assert torch.cuda.is_available(), "need a CUDA device to run the Triton kernel"
+	device = "cuda"
+
+	# Small sizes; a *small* dilation relative to L makes the race most likely.
+	N, L, C = 2, 64, 8
+	for dilation in (1, 2, 4):
+		x = torch.randn(N, L, C, device=device, requires_grad=True)
+		w = torch.randn(3, C, device=device, requires_grad=True)
+
+		y = FusedDilatedConvNormFunc.apply(x, w, dilation)  # forward
+		# Any scalar loss works; .backward() triggers bwd_conv_kernel + the assert.
+		y.sum().backward()
+
+		# If we reach here, the assert inside backward did NOT fire for this config.
+		print(f"dilation={dilation}: no race detected (assert passed)")
+
+
+if __name__ == "__main__":
+	_detect_dx_write_race()
