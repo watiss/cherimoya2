@@ -214,24 +214,24 @@ def bwd_conv_kernel(
 		dw1 += tl.sum(d_conv * x1, axis=0)[None, :]
 		dw2 += tl.sum(d_conv * x2, axis=0)[None, :]
 	
-		dx_idx0 = dX_ptr + pid_n * stride_xn + offs * C + offs_c
+		# dx_idx0 = dX_ptr + pid_n * stride_xn + offs * C + offs_c
 
-		dx1 = tl.load(dx_idx0, mask=mask, other=0.0)
-		dx0 = tl.load(dx_idx0 - dilation*C, mask=mask_l, other=0.0)
-		dx2 = tl.load(dx_idx0 + dilation*C, mask=mask_r, other=0.0)
+		# dx1 = tl.load(dx_idx0, mask=mask, other=0.0)
+		# dx0 = tl.load(dx_idx0 - dilation*C, mask=mask_l, other=0.0)
+		# dx2 = tl.load(dx_idx0 + dilation*C, mask=mask_r, other=0.0)
 	
-		dx1 += d_conv * w1
-		dx0 += d_conv * w0
-		dx2 += d_conv * w2
+		# dx1 += d_conv * w1
+		# dx0 += d_conv * w0
+		# dx2 += d_conv * w2
 
-		tl.store(dx_idx0,              dx1, mask=mask)
-		tl.store(dx_idx0 - dilation*C, dx0, mask=mask_l)
-		tl.store(dx_idx0 + dilation*C, dx2, mask=mask_r)
+		# tl.store(dx_idx0,              dx1, mask=mask)
+		# tl.store(dx_idx0 - dilation*C, dx0, mask=mask_l)
+		# tl.store(dx_idx0 + dilation*C, dx2, mask=mask_r)
 	
-		# dx_idx = dX_ptr + pid_n * stride_xn + offs * C + offs_c
-		# tl.atomic_add(dx_idx, d_conv * w1, mask=mask)
-		# tl.atomic_add(dx_idx - dilation * C, d_conv * w0, mask=mask_l)
-		# tl.atomic_add(dx_idx + dilation * C, d_conv * w2, mask=mask_r)
+		dx_idx = dX_ptr + pid_n * stride_xn + offs * C + offs_c
+		tl.atomic_add(dx_idx, d_conv * w1, mask=mask)
+		tl.atomic_add(dx_idx - dilation * C, d_conv * w0, mask=mask_l)
+		tl.atomic_add(dx_idx + dilation * C, d_conv * w2, mask=mask_r)
 
 	dw_idx = dW_ptr + pid_n * (C * 3) + offs_c
 	tl.store(dw_idx,       dw0, mask=mask_c)
